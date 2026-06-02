@@ -51,6 +51,20 @@ HEAVY_BUCKET_PRIORITY = (
     "com.fasterxml.jackson.core.jackson-databind",
 )
 
+MODULE_SCOPE_LABELS = {
+    "collections_iterators_functors",
+    "collections_list_set_bag",
+    "collections_map",
+    "compress_archivers",
+    "compress_compressors",
+    "compress_gzip_bzip2",
+    "compress_tar",
+    "compress_zip",
+    "io_input",
+    "io_output",
+    "io_root_file",
+}
+
 
 class _StubThirdLib:
     """Compatibility shim for skeleton pickles created from a __main__ helper."""
@@ -1250,13 +1264,45 @@ def _match_pickle_family(pickle_stem: str, families: Set[str]) -> Optional[str]:
     return sorted(matches, key=len, reverse=True)[0]
 
 
+def _extract_skeleton_scope_label(pickle_stem: str, family: str) -> str:
+    base = (pickle_stem or "").strip()
+    if base.endswith("_skeleton"):
+        base = base[:-len("_skeleton")]
+    prefix = family + "_"
+    if base.startswith(prefix):
+        return base[len(prefix):].strip("_")
+    return ""
+
+
+def _classify_skeleton_scope(scope_label: str) -> str:
+    label = (scope_label or "").strip("_")
+    if not label:
+        return "library"
+    if label in MODULE_SCOPE_LABELS:
+        return "module"
+    return "version_range"
+
+
+def _make_skeleton_entry(family: str, pickle_path: str, cache_name: str) -> dict:
+    stem = cache_name[:-4].strip() if cache_name.endswith(".pkl") else cache_name.strip()
+    scope_label = _extract_skeleton_scope_label(stem, family)
+    scope_type = _classify_skeleton_scope(scope_label)
+    return {
+        "family": family,
+        "pickle_path": pickle_path,
+        "cache_name": cache_name,
+        "scope_type": scope_type,
+        "scope_label": scope_label,
+    }
+
+
 def _index_skeleton_pickles(
     *,
     cache_dir: str,
     families: Set[str],
     logger,
-) -> Dict[str, str]:
-    skeletons: Dict[str, str] = {}
+) -> Dict[str, List[dict]]:
+    skeletons: Dict[str, List[dict]] = {}
     if not os.path.isdir(cache_dir):
         return skeletons
 
@@ -1268,7 +1314,8 @@ def _index_skeleton_pickles(
         if not family:
             logger.warning("[libhunter] skeleton pickle has no version family: %s", name)
             continue
-        skeletons[family] = os.path.join(cache_dir, name)
+        entry = _make_skeleton_entry(family, os.path.join(cache_dir, name), name)
+        skeletons.setdefault(family, []).append(entry)
     return skeletons
 
 
@@ -1418,7 +1465,17 @@ def _detect_one_lib_detail_task(args):
 
 
 def _detect_one_skeleton_detail_task(args):
-    family, skeleton_pickle_path = args
+    if isinstance(args, dict):
+        family = str(args.get("family", "")).strip()
+        skeleton_pickle_path = str(args.get("pickle_path", "")).strip()
+        cache_name = str(args.get("cache_name", "")).strip()
+        scope_type = str(args.get("scope_type", "library")).strip() or "library"
+        scope_label = str(args.get("scope_label", "")).strip()
+    else:
+        family, skeleton_pickle_path = args
+        cache_name = os.path.basename(str(skeleton_pickle_path))
+        scope_label = ""
+        scope_type = "library"
     logger = _DETECT_LOGGER if _DETECT_LOGGER is not None else setup_logger()
     if _DETECT_APK_OBJ is None:
         return None
@@ -1444,6 +1501,9 @@ def _detect_one_skeleton_detail_task(args):
     return {
         "library_family": family,
         "selected_version": "_skeleton",
+        "cache_name": cache_name,
+        "scope_type": scope_type,
+        "scope_label": scope_label,
         "lib": lib_name,
         "similarity": float(detail.get("similarity", detail.get("score", 0.0)) or 0.0),
         "matched": bool(detail.get("matched", False)),
@@ -1611,7 +1671,7 @@ def _run_detection_for_buckets(
 def _run_detection_for_skeletons(
     *,
     apk_pickle_path: str,
-    skeletons: Dict[str, str],
+    skeletons: Dict[str, List[dict]],
     thread_num: int,
     apk_label: str,
     logger,
@@ -1619,7 +1679,14 @@ def _run_detection_for_skeletons(
     if not skeletons:
         return []
 
-    detect_tasks = sorted(skeletons.items())
+    detect_tasks = sorted(
+        [
+            dict(entry)
+            for entries in skeletons.values()
+            for entry in entries
+        ],
+        key=_skeleton_pipeline_sort_key,
+    )
     details: List[dict] = []
     try:
         with Pool(
@@ -1651,7 +1718,11 @@ def _run_detection_for_skeletons(
 
 
 def _skeleton_pipeline_sort_key(item):
-    family, pickle_path = item
+    if isinstance(item, dict):
+        family = str(item.get("family", "")).strip()
+        pickle_path = str(item.get("pickle_path", "")).strip()
+    else:
+        family, pickle_path = item
     try:
         size = os.path.getsize(pickle_path)
     except OSError:
@@ -1664,7 +1735,7 @@ def _skeleton_pipeline_sort_key(item):
 def _run_stage1_bucket_pipeline(
     *,
     apk_pickle_path: str,
-    skeletons: Dict[str, str],
+    skeletons: Dict[str, List[dict]],
     buckets: Dict[str, Dict[str, str]],
     thread_num: int,
     apk_label: str,
@@ -1684,7 +1755,12 @@ def _run_stage1_bucket_pipeline(
     bucket_start_at = None
     bucket_done_at = None
 
-    skeleton_pending = deque(sorted(skeletons.items(), key=_skeleton_pipeline_sort_key))
+    skeleton_tasks = [
+        dict(entry)
+        for entries in skeletons.values()
+        for entry in entries
+    ]
+    skeleton_pending = deque(sorted(skeleton_tasks, key=_skeleton_pipeline_sort_key))
     bucket_pending = deque()
     active = []
     active_counts = {"skeleton": 0, "bucket": 0}
@@ -1719,7 +1795,7 @@ def _run_stage1_bucket_pipeline(
             else:
                 break
 
-    stage1_bar = tqdm(total=len(skeletons), desc=f"Stage1 {apk_label}", colour='cyan')
+    stage1_bar = tqdm(total=len(skeleton_tasks), desc=f"Stage1 {apk_label}", colour='cyan')
     bucket_bar = tqdm(total=0, desc=f"Bucket {apk_label}", colour='magenta')
     try:
         with Pool(
@@ -1767,7 +1843,7 @@ def _run_stage1_bucket_pipeline(
                                     bucket_pending.extend(family_bucket_tasks)
                                     bucket_bar.total += len(family_bucket_tasks)
                                     bucket_bar.refresh()
-                        if completed_skeletons == len(skeletons) and stage1_done_at is None:
+                        if completed_skeletons == len(skeleton_tasks) and stage1_done_at is None:
                             stage1_done_at = datetime.datetime.now()
                     elif result_kind == "bucket":
                         completed_buckets += 1
@@ -1781,7 +1857,7 @@ def _run_stage1_bucket_pipeline(
     except (PermissionError, OSError, RuntimeError) as e:
         logger.warning("Pool init failed in stage1/bucket pipeline, fallback to serial mode: %s", e)
         _init_detect_worker(apk_pickle_path)
-        for task in sorted(skeletons.items(), key=_skeleton_pipeline_sort_key):
+        for task in sorted(skeleton_tasks, key=_skeleton_pipeline_sort_key):
             row = _detect_one_skeleton_detail_task(task)
             completed_skeletons += 1
             stage1_bar.update(1)
@@ -1840,6 +1916,118 @@ def _extract_candidate_families(skeleton_details: List[dict]) -> List[str]:
         if bool(row.get("matched", False)) and str(row.get("library_family", "")).strip()
     })
     return candidates
+
+
+def _extract_candidate_scopes(skeleton_details: List[dict]) -> List[dict]:
+    scopes: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for row in skeleton_details:
+        if not bool(row.get("matched", False)):
+            continue
+        family = str(row.get("library_family", "")).strip()
+        if not family:
+            continue
+        scope_type = str(row.get("scope_type", "library")).strip() or "library"
+        scope_label = str(row.get("scope_label", "")).strip()
+        cache_name = str(row.get("cache_name", "")).strip()
+        key = (family, scope_type, scope_label, cache_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        scopes.append({
+            "family": family,
+            "scope_type": scope_type,
+            "scope_label": scope_label,
+            "cache_name": cache_name,
+            "similarity": float(row.get("similarity", 0.0) or 0.0),
+        })
+    scopes.sort(key=lambda item: (
+        item.get("family", ""),
+        item.get("scope_type", ""),
+        item.get("scope_label", ""),
+        item.get("cache_name", ""),
+    ))
+    return scopes
+
+
+def _version_major(version: str) -> str:
+    match = re.search(r"\d+", str(version or ""))
+    return match.group(0) if match else ""
+
+
+def _version_numbers(version: str) -> list[int]:
+    return [int(value) for value in re.findall(r"\d+", str(version or ""))]
+
+
+def _version_matches_scope_label(version: str, scope_label: str) -> bool:
+    label = (scope_label or "").strip("_").lower()
+    if not label:
+        return True
+
+    numbers = _version_numbers(version)
+    if not numbers:
+        return False
+
+    major_match = re.fullmatch(r"(\d+)x(?:_android)?", label)
+    if major_match:
+        return numbers[0] == int(major_match.group(1))
+
+    android_match = re.fullmatch(r"android_(\d+)_(\d+)", label)
+    if android_match and len(numbers) >= 2:
+        return numbers[0] == int(android_match.group(1)) and numbers[1] == int(android_match.group(2))
+
+    plus_match = re.fullmatch(r"(\d+)_(\d+)_plus", label)
+    if plus_match and len(numbers) >= 2:
+        major = int(plus_match.group(1))
+        minor = int(plus_match.group(2))
+        return numbers[0] == major and numbers[1] >= minor
+
+    range_match = re.fullmatch(r"(\d+)_(\d+)_to_(\d+)_(\d+)", label)
+    if range_match and len(numbers) >= 2:
+        start = (int(range_match.group(1)), int(range_match.group(2)))
+        end = (int(range_match.group(3)), int(range_match.group(4)))
+        current = (numbers[0], numbers[1])
+        return start <= current <= end
+
+    exact_major_minor = re.fullmatch(r"(\d+)_(\d+)", label)
+    if exact_major_minor and len(numbers) >= 2:
+        return numbers[0] == int(exact_major_minor.group(1)) and numbers[1] == int(exact_major_minor.group(2))
+
+    exact_major_minor_patch = re.fullmatch(r"(\d+)_(\d+)_(\d+)", label)
+    if exact_major_minor_patch and len(numbers) >= 3:
+        return (
+            numbers[0] == int(exact_major_minor_patch.group(1))
+            and numbers[1] == int(exact_major_minor_patch.group(2))
+            and numbers[2] == int(exact_major_minor_patch.group(3))
+        )
+
+    early_late_labels = {
+        "early_mid",
+        "late",
+    }
+    if label in early_late_labels:
+        return True
+
+    return False
+
+
+def _select_versions_for_scope(scope: dict, version_index: Dict[str, List[dict]]) -> List[dict]:
+    family = str(scope.get("family", "")).strip()
+    scope_type = str(scope.get("scope_type", "library")).strip() or "library"
+    scope_label = str(scope.get("scope_label", "")).strip()
+    family_versions = version_index.get(family, [])
+
+    if scope_type in {"library", "module"}:
+        return list(family_versions)
+    if scope_type != "version_range":
+        return list(family_versions)
+
+    matched = [
+        entry
+        for entry in family_versions
+        if _version_matches_scope_label(str(entry.get("version", "")), scope_label)
+    ]
+    return matched or list(family_versions)
 
 
 def _aggregate_best_by_family(version_details: List[dict]) -> List[dict]:
@@ -1975,9 +2163,10 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
     all_libs_num = len(libs_list)
     LOGGER.info("The number of libraries analyzed this time is: %d", all_libs_num)
     LOGGER.info(
-        "[libhunter] version families=%d skeleton families=%d bucket families=%d",
+        "[libhunter] version families=%d skeleton families=%d skeleton pickles=%d bucket families=%d",
         len(version_index),
         len(skeleton_pickles),
+        sum(len(entries) for entries in skeleton_pickles.values()),
         len(bucket_pickles),
     )
 
@@ -2011,7 +2200,7 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
             LOGGER.info(
                 "[libhunter] %s stage1_skeletons=%d candidate_families=%d stage1_time=%ss pipeline_time=%ss",
                 apk,
-                len(skeleton_pickles),
+                sum(len(entries) for entries in skeleton_pickles.values()),
                 len(candidate_families),
                 pipeline_stats.get("stage1_time", 0),
                 pipeline_stats.get("pipeline_time", 0),
@@ -2029,6 +2218,7 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
                 LOGGER.info("Current apk analysis time: %d (in seconds)", apk_time)
                 continue
 
+            candidate_scopes = _extract_candidate_scopes(skeleton_details)
             version_lookup: Dict[str, Dict[str, dict]] = {
                 family: {
                     str(entry.get("version", "")).strip(): entry
@@ -2106,8 +2296,37 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
                     )
                     continue
 
-                for version_entry in version_index.get(family, []):
-                    _add_candidate_version(version_entry)
+                family_scopes = [
+                    scope
+                    for scope in candidate_scopes
+                    if str(scope.get("family", "")).strip() == family
+                ]
+                if not family_scopes:
+                    for version_entry in version_index.get(family, []):
+                        _add_candidate_version(version_entry)
+                    continue
+
+                before_count = len(candidate_versions)
+                for scope in family_scopes:
+                    selected_versions = _select_versions_for_scope(scope, version_index)
+                    for version_entry in selected_versions:
+                        _add_candidate_version(version_entry)
+                    LOGGER.info(
+                        "[libhunter] %s scope selected family=%s cache=%s scope=%s/%s similarity=%.6f versions=%d",
+                        apk,
+                        family,
+                        scope.get("cache_name", ""),
+                        scope.get("scope_type", ""),
+                        scope.get("scope_label", ""),
+                        float(scope.get("similarity", 0.0)),
+                        len(selected_versions),
+                    )
+                LOGGER.info(
+                    "[libhunter] %s family=%s scoped candidate versions added=%d",
+                    apk,
+                    family,
+                    len(candidate_versions) - before_count,
+                )
         else:
             LOGGER.warning(
                 "[libhunter] no skeleton pickles found in %s; fallback to full version scan",
